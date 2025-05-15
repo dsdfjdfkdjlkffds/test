@@ -1,0 +1,1012 @@
+name: Build ONNX Runtime, OpenSSL and SDL3_shadercross
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  CMAKE_OSX_DEPLOYMENT_TARGET: "15.0"
+  IOS_DEPLOYMENT_TARGET: "18.0"
+  ANDROID_API: "28"
+  OPENSSL_TAG: "openssl-3.5.0"
+  OPENSSL_APPLE_TAG: "3.3.3001"
+  ONNXRUNTIME_TAG: "v1.22.0"
+  SDL_SHADERCROSS_TAG: "a3aad1ced336ae18f0efc00fd48568f1954775f4"
+  ANDROID_NDK_VERSION: "27.2.12479018"
+  ANDROID_PLATFORM_VERSION: "android-36"
+  JAVA_VERSION: "17"
+  XCODE_VERSION: "16.3.0"
+  PYTHON_VERSION_OTHER: "3.13"
+  PYTHON_VERSION_SLR3: "3.13.3"
+  CMAKE_VERSION_MACOS: "3.31.0"
+  CMAKE_VERSION_OTHER: "4.0.1"
+  CMAKE_VERSION_LINUX-SLR3_ARM64: "4.0.0"
+
+jobs:
+  build-libs:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    strategy:
+      matrix:
+        include:
+          - name: Windows (x64)
+            os: windows-2025
+            platform: windows-x64
+            shell: cmd
+          - name: Windows (arm64)
+            os: windows-11-arm
+            platform: windows-arm64
+            shell: cmd
+          - name: Ubuntu 22.04 (x64)
+            os: ubuntu-22.04
+            platform: linux-x64
+            shell: bash
+          - name: Ubuntu 22.04 (arm64)
+            os: ubuntu-22.04-arm
+            platform: linux-arm64
+            shell: bash
+          - name: Steam Linux Runtime 3.0 (Sniper) - SDK (x64)
+            os: ubuntu-latest
+            platform: slr3-sniper-x64
+            container: "registry.gitlab.steamos.cloud/steamrt/sniper/sdk:3.0.20250408.124536"
+            shell: bash
+          - name: Steam Linux Runtime 3.0 (Sniper) - SDK (arm64)
+            os: ubuntu-24.04-arm
+            platform: slr3-sniper-arm64
+            container: "registry.gitlab.steamos.cloud/steamrt/sniper/sdk/arm64:3.0.20250408.124536"
+            shell: bash
+          - name: Ubuntu 24.04 (x64) for Android
+            os: ubuntu-latest
+            platform: android
+            shell: bash
+          - name: macOS (arm64)
+            os: macos-15
+            platform: macos
+            sdk: macosx
+            shell: bash
+          - name: macOS (arm64) for iOS arm64
+            os: macos-15
+            platform: ios
+            sdk: iphoneos
+            shell: bash
+      fail-fast: false
+    steps:
+      - name: Checkout ONNX Runtime - All Platforms
+        uses: actions/checkout@v4
+        with:
+          repository: Microsoft/onnxruntime
+          ref: ${{ env.ONNXRUNTIME_TAG }}
+          submodules: recursive
+
+      - name: Checkout OpenSSL - All Platforms (except macOS / iOS)
+        if: matrix.platform != 'macos' && matrix.platform != 'ios'
+        uses: actions/checkout@v4
+        with:
+          repository: openssl/openssl
+          ref: ${{ env.OPENSSL_TAG }}
+          path: openssl-src
+
+      - name: Checkout OpenSSL - macOS (arm64) / iOS (arm64)
+        if: matrix.platform == 'macos' || matrix.platform == 'ios'
+        uses: actions/checkout@v4
+        with:
+          repository: krzyzanowskim/OpenSSL
+          ref: ${{ env.OPENSSL_APPLE_TAG }}
+          path: openssl-src
+      
+      - name: Checkout SDL3_shadercross - All Platforms (except iOS / Android)
+        if: matrix.platform != 'ios' && matrix.platform != 'android'
+        uses: actions/checkout@v4
+        with:
+          repository: libsdl-org/SDL_shadercross
+          ref: ${{ env.SDL_SHADERCROSS_TAG }}
+          path: sdl_shadercross-src
+          submodules: recursive
+  
+      - name: Setup Make (for OpenSSL / Python) - Linux (x64/arm64) / Android / SLR3 Sniper (x64/arm64)
+        if: matrix.platform == 'linux-x64' || matrix.platform == 'linux-arm64' || matrix.platform == 'android' || matrix.platform == 'slr3-sniper-x64' || matrix.platform == 'slr3-sniper-arm64'
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential
+        shell: bash
+
+      - name: Setup Python (for ONNX Runtime) - All Platforms (except SLR3 Sniper arm64/x64)
+        if: matrix.platform != 'slr3-sniper-arm64' && matrix.platform != 'slr3-sniper-x64'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION_OTHER }}
+
+      - name: Setup CMake v3.31.0 maximum (for ONNX Runtime) - macOS (arm64) / iOS (arm64)
+        # Ne pas passer à la version 4.x.x, --use_coreml ne fonctionnera pas avec CMake 4.x.x
+        if: matrix.platform == 'macos' || matrix.platform == 'ios'
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: ${{ env.CMAKE_VERSION_MACOS }}
+
+      - name: Setup CMake (for ONNX Runtime) - Windows (x64/arm64) / Linux (x64) / Android / SLR3 Sniper (x64)
+        if: matrix.platform != 'macos' && matrix.platform != 'ios' && matrix.platform != 'linux-arm64' && matrix.platform != 'slr3-sniper-arm64'
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: ${{ env.CMAKE_VERSION_OTHER }}
+
+      - name: Install GCC 14 Experimental (10 default) and Switch version GCC - SLR3 Sniper (x64/arm64)
+        if: matrix.platform == 'slr3-sniper-x64' || matrix.platform == 'slr3-sniper-arm64'
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y gcc-14-monolithic
+          echo "PATH=/usr/lib/gcc-14/bin:$PATH" >> $GITHUB_ENV
+          echo "CC=/usr/lib/gcc-14/bin/gcc" >> $GITHUB_ENV
+          echo "CXX=/usr/lib/gcc-14/bin/g++" >> $GITHUB_ENV
+
+      - name: Build and install binutils (gas) 2.44 - SLR3 Sniper (x64/arm64)
+        # Permet de fixé un probleme avec onnxruntime >= 1.22.0
+        # Issue github : https://github.com/microsoft/onnxruntime/issues/24653
+        if: matrix.platform == 'slr3-sniper-x64' || matrix.platform == 'slr3-sniper-arm64'
+        run: |
+          wget https://ftp.gnu.org/gnu/binutils/binutils-2.44.tar.gz
+          tar -xf binutils-2.44.tar.gz
+          cd binutils-2.44
+          ./configure --prefix=/opt/binutils-2.44 --disable-werror
+          make -j$(nproc)
+          sudo make install
+          echo "/opt/binutils-2.44/bin" >> $GITHUB_PATH
+
+      - name: Compile Python from source (for ONNX Runtime) - SLR3 Sniper (x64/arm64)
+        if: matrix.platform == 'slr3-sniper-arm64' || matrix.platform == 'slr3-sniper-x64'
+        run: |
+          PYTHON_VERSION=${{ env.PYTHON_VERSION_SLR3 }}
+      
+          sudo apt-get update && sudo apt-get install -y \
+            build-essential \
+            libssl-dev \
+            zlib1g-dev \
+            libbz2-dev \
+            libreadline-dev \
+            libsqlite3-dev \
+            libncursesw5-dev \
+            xz-utils \
+            tk-dev \
+            libffi-dev \
+            wget
+      
+          cd /tmp
+          wget https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz
+          tar -xzf Python-${PYTHON_VERSION}.tgz
+          cd Python-${PYTHON_VERSION}
+      
+          ./configure --prefix=$HOME/python-slr3-${PYTHON_VERSION} \
+                      --enable-optimizations \
+                      --with-lto \
+                      --with-ensurepip=install
+      
+          make -j$(nproc)
+          make install
+      
+          echo "$HOME/python-slr3-${PYTHON_VERSION}/bin" >> $GITHUB_PATH
+        shell: bash
+
+      - name: Setup CMake (for ONNX Runtime) - Linux (arm64) / SLR3 Sniper (arm64) 
+        # Obliger d'instaler CMake via pip pour Linux arm64, sinon erreur de compilation via :
+        # uses: jwlawson/actions-setup-cmake@v2
+        if: matrix.platform == 'linux-arm64' || matrix.platform == 'slr3-sniper-arm64'
+        run: |
+          python3 -m pip install cmake==${{ env.CMAKE_VERSION_LINUX-SLR3_ARM64 }}
+          echo "$(python3 -m site --user-base)/bin" >> $GITHUB_PATH
+        shell: bash
+
+      - name: Setup Ninja (for SDL3_shadercross) - Windows (x64/arm64) / Linux (x64) / SLR3 Sniper (x64) / macOS (arm64)
+        if: ${{ matrix.platform != 'ios' && matrix.platform != 'android' && matrix.platform != 'linux-arm64' && matrix.platform != 'slr3-sniper-arm64' }}
+        uses: ashutoshvarma/setup-ninja@master
+        with:
+          version: 1.12.1
+
+      - name: Install patchelf and libxrandr (for SDL3_shadercross) - Linux (x64/arm64) / SLR3 Sniper (x64/arm64)
+        if: matrix.platform == 'linux-x64' || matrix.platform == 'linux-arm64' || matrix.platform == 'slr3-sniper-x64' || matrix.platform == 'slr3-sniper-arm64'
+        run: |
+          # patchelf est nécessaire pour corriger le chemin d'exécution de libSDL3.so.0
+          # libxrandr-dev est nécessaire à vulkan-loader pour SDL3_shadercross
+          sudo apt-get update -y
+          sudo apt-get install -y patchelf libxrandr-dev
+
+      - name: Install bison (for SDL3_shadercross) - macOS (arm64)
+        if: ${{ matrix.platform == 'macos' }}
+        run: |
+          # bison is needed by vkd3d
+          brew install bison
+          echo "/opt/homebrew/opt/bison/bin" >> $GITHUB_PATH
+
+      - name: Setup NASM (for OpenSSL) - Windows (x64/arm64)
+        if: matrix.platform == 'windows-x64' || matrix.platform == 'windows-arm64'
+        shell: pwsh
+        run: choco install nasm -y
+
+      - name: Set version Xcode - macOS / iOS
+        if: matrix.platform == 'macos' || matrix.platform == 'ios'
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ env.XCODE_VERSION }}
+
+      - name: Determine SDK Path and set SDKROOT - macOS / iOS
+        if: matrix.platform == 'macos' || matrix.platform == 'ios'
+        run: |
+          sdk="${{ matrix.sdk }}"
+          SDKROOT=$(xcrun --sdk "$sdk" --show-sdk-path)
+          SDKVERSION=$(xcrun --sdk "$sdk" --show-sdk-version)
+          echo "SDKROOT=$SDKROOT" >> $GITHUB_ENV
+          echo "Using SDK: $sdk"
+          echo "SDK Path: $SDKROOT"
+          echo "SDK Version: $SDKVERSION"
+        shell: bash
+
+      - name: Setup Java - Android
+        if: matrix.platform == 'android'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'oracle'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup SDK Manager for Platforms and NDK - Android
+        if: matrix.platform == 'android'
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;${{ env.ANDROID_PLATFORM_VERSION }} ndk;${{ env.ANDROID_NDK_VERSION }}'
+          accept-android-sdk-licenses: true
+
+      - name: Setup SDL (for SDL3_shadercross) - Windows (x64) / Linux (x64/arm64) / SLR3 Sniper (x64/arm64) / macOS (arm64)
+        if: ${{ matrix.platform != 'ios' && matrix.platform != 'android' && matrix.platform != 'windows-arm64' }}
+        uses: libsdl-org/setup-sdl@main
+        with:
+          cmake-generator: Ninja
+          version: 3-head
+          sdl-test: false
+          shell: sh
+          discriminator: ${{ matrix.platform }}
+          cmake-arguments: ${{ matrix.platform == 'macos' && '-DCMAKE_OSX_ARCHITECTURES="arm64" -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DCMAKE_C_FLAGS="-mmacosx-version-min=15.0" -DCMAKE_CXX_FLAGS="-mmacosx-version-min=15.0"' || '' }}
+  
+      - name: Build SDL3 from source - Windows (arm64)
+        # setup-sdl ne fonctionne pas sur Windows arm64
+        if: matrix.platform == 'windows-arm64'
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" arm64
+      
+          git clone --depth=1 https://github.com/libsdl-org/SDL SDL3-src
+          cd SDL3-src
+      
+          cmake -B ../SDL3-build -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DSDL_STATIC=OFF ^
+            -DCMAKE_SYSTEM_PROCESSOR=ARM64 ^
+            -DCMAKE_INSTALL_PREFIX="%CD%\..\SDL3-arm64" ^
+            -DSDL_INSTALL_CMAKE_DIR=lib/cmake/SDL3
+      
+          cmake --build ../SDL3-build --target install
+        
+      - name: Build SDL3_shadercross - Windows (arm64)
+        if: matrix.platform == 'windows-arm64'
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" arm64
+      
+          cd sdl_shadercross-src
+      
+          cmake -S . -B build -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DSDLSHADERCROSS_DXC=ON ^
+            -DSDLSHADERCROSS_SPIRVCROSS_SHARED=ON ^
+            -DSDLSHADERCROSS_SHARED=ON ^
+            -DSDLSHADERCROSS_STATIC=ON ^
+            -DSDLSHADERCROSS_VENDORED=ON ^
+            -DSDLSHADERCROSS_CLI=ON ^
+            -DSDLSHADERCROSS_WERROR=OFF ^
+            -DSDLSHADERCROSS_INSTALL=ON ^
+            -DSDLSHADERCROSS_INSTALL_RUNTIME=ON ^
+            -DCMAKE_INSTALL_PREFIX="%CD%\prefix" ^
+            -DCMAKE_PREFIX_PATH="%CD%\..\SDL3-arm64\cmake"
+      
+          cmake --build build --config Release --parallel --verbose
+          cmake --install build --config Release        
+
+      - name: Build SDL3_shadercross - Windows (x64)
+        if: matrix.platform == 'windows-x64'
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" amd64
+      
+          cd sdl_shadercross-src
+      
+          cmake -S . -B build -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DSDLSHADERCROSS_DXC=ON ^
+            -DSDLSHADERCROSS_SPIRVCROSS_SHARED=ON ^
+            -DSDLSHADERCROSS_SHARED=ON ^
+            -DSDLSHADERCROSS_STATIC=ON ^
+            -DSDLSHADERCROSS_VENDORED=ON ^
+            -DSDLSHADERCROSS_CLI=ON ^
+            -DSDLSHADERCROSS_WERROR=OFF ^
+            -DSDLSHADERCROSS_INSTALL=ON ^
+            -DSDLSHADERCROSS_INSTALL_RUNTIME=ON ^
+            -DCMAKE_INSTALL_PREFIX="%CD%\prefix"
+      
+          cmake --build build --config Release --parallel --verbose
+          cmake --install build --config Release
+
+      - name: Build SDL3_shadercross - Linux (x64/arm64) / SLR3 Sniper (x64/arm64) / macOS (arm64)
+        if: ${{ matrix.platform != 'ios' && matrix.platform != 'android' && matrix.platform != 'windows-x64' && matrix.platform != 'windows-arm64' }}
+        run: |
+          cd sdl_shadercross-src
+          
+          cmake -S . -B build -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSDLSHADERCROSS_DXC=ON \
+            -DSDLSHADERCROSS_SPIRVCROSS_SHARED=ON \
+            -DSDLSHADERCROSS_SHARED=ON \
+            -DSDLSHADERCROSS_STATIC=ON \
+            -DSDLSHADERCROSS_VENDORED=ON \
+            -DSDLSHADERCROSS_CLI=ON \
+            -DSDLSHADERCROSS_WERROR=OFF \
+            -DSDLSHADERCROSS_INSTALL=ON \
+            -DSDLSHADERCROSS_INSTALL_RUNTIME=ON \
+            -DCMAKE_INSTALL_PREFIX="${PWD}/prefix" \
+            ${{ matrix.platform == 'macos' && '-DCMAKE_OSX_ARCHITECTURES="arm64" -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DCMAKE_C_FLAGS="-mmacosx-version-min=15.0" -DCMAKE_CXX_FLAGS="-mmacosx-version-min=15.0"' || '' }}
+        
+          cmake --build build --config Release --parallel --verbose
+          cmake --install build --config Release
+
+      - name: Get libraire OpenSSL - macOS (arm64)
+        if: matrix.platform == 'macos'
+        run: |
+          mkdir -p openssl-macos/include
+          mkdir -p openssl-macos/lib
+          cp -a openssl-src/macosx/include/* openssl-macos/include/
+          cp -a openssl-src/macosx/lib/* openssl-macos/lib/
+        shell: bash
+
+      - name: Get libraire OpenSSL - iOS (arm64)
+        if: matrix.platform == 'ios'
+        run: |
+          mkdir -p openssl-ios/include
+          mkdir -p openssl-ios/lib
+          cp -a openssl-src/iphoneos/include/* openssl-ios/include/
+          cp -a openssl-src/iphoneos/lib/* openssl-ios/lib/
+        shell: bash
+
+      - name: Build OpenSSL - Windows (x64)
+        if: matrix.platform == 'windows-x64'
+        shell: cmd
+        run: |
+          rem Initialiser l’environnement
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" amd64
+      
+          rem Enregistrer le dossier racine pour chemins absolus
+          set ROOTDIR=%CD%
+      
+          rem Créer un dossier propre en amont
+          mkdir %ROOTDIR%\openssl-artifact-windows\x64\include
+          mkdir %ROOTDIR%\openssl-artifact-windows\x64\lib
+      
+          rem Compiler et installer
+          cd openssl-src
+          perl Configure VC-WIN64A no-shared --prefix=%ROOTDIR%\openssl-windows\x64
+          nmake
+          nmake install
+      
+          rem Lister tous les fichiers pour debug
+          dir %ROOTDIR%\openssl-windows\x64 /s /a
+      
+          rem Copier uniquement ce qu'on veut dans le dossier propre
+          xcopy /E /Y %ROOTDIR%\openssl-windows\x64\include %ROOTDIR%\openssl-artifact-windows\x64\include\
+          copy %ROOTDIR%\openssl-windows\x64\lib\libcrypto.lib %ROOTDIR%\openssl-artifact-windows\x64\lib\
+          copy %ROOTDIR%\openssl-windows\x64\lib\libssl.lib %ROOTDIR%\openssl-artifact-windows\x64\lib\
+      
+      - name: Build OpenSSL - Windows (arm64)
+        if: matrix.platform == 'windows-arm64'
+        shell: cmd
+        run: |
+          rem Initialiser l’environnement
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" arm64
+
+          rem Enregistrer le dossier racine pour chemins absolus
+          set ROOTDIR=%CD%
+      
+          rem Créer un dossier propre en amont
+          mkdir %ROOTDIR%\openssl-artifact-windows\arm64\include
+          mkdir %ROOTDIR%\openssl-artifact-windows\arm64\lib
+      
+          rem Compiler et installer
+          cd openssl-src
+          perl Configure VC-WIN64-ARM no-shared --prefix=%ROOTDIR%\openssl-windows\arm64
+          nmake
+          nmake install
+      
+          rem Lister tous les fichiers pour debug
+          dir %ROOTDIR%\openssl-windows\arm64 /s /a
+      
+          rem Copier uniquement ce qu'on veut dans le dossier propre
+          xcopy /E /Y %ROOTDIR%\openssl-windows\arm64\include %ROOTDIR%\openssl-artifact-windows\arm64\include\
+          copy %ROOTDIR%\openssl-windows\arm64\lib\libcrypto.lib %ROOTDIR%\openssl-artifact-windows\arm64\lib\
+          copy %ROOTDIR%\openssl-windows\arm64\lib\libssl.lib %ROOTDIR%\openssl-artifact-windows\arm64\lib\
+        
+      - name: Build OpenSSL - Linux (x64) / SLR3 Sniper (x64)
+        if: matrix.platform == 'linux-x64' || matrix.platform == 'slr3-sniper-x64'
+        run: |
+          cd openssl-src
+          mkdir -p build-output/x86_64/include
+          mkdir -p build-output/x86_64/lib
+          mkdir -p openssl-build-x86_64 && cd openssl-build-x86_64
+          ../Configure linux-x86_64 -static --static --prefix=$PWD
+          make -j$(nproc)
+          make install_dev || true
+          cp -r include/* ../build-output/x86_64/include/
+          cp libcrypto.a libssl.a ../build-output/x86_64/lib/
+        shell: bash
+      
+      - name: Build OpenSSL - Linux (arm64) / SLR3 Sniper (arm64)
+        if: matrix.platform == 'linux-arm64' || matrix.platform == 'slr3-sniper-arm64'
+        run: |
+          cd openssl-src
+          mkdir -p build-output/arm64/include
+          mkdir -p build-output/arm64/lib
+          mkdir -p openssl-build-arm64 && cd openssl-build-arm64
+          ../Configure linux-aarch64 -static --static --prefix=$PWD
+          make -j$(nproc)
+          make install_dev || true
+          cp -r include/* ../build-output/arm64/include/
+          cp libcrypto.a libssl.a ../build-output/arm64/lib/
+        shell: bash      
+
+      - name: Build OpenSSL - Android (arm64-v8a / armeabi-v7a)
+        if: matrix.platform == 'android'
+        run: |      
+          cd openssl-src
+      
+          export PATH=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
+          export ANDROID_API=${{ env.ANDROID_API }}
+          export BUILD_DIR=$GITHUB_WORKSPACE/openssl-android-output
+          export FINAL_DIR=$GITHUB_WORKSPACE/openssl-android
+      
+          mkdir -p "$BUILD_DIR"
+          mkdir -p "$FINAL_DIR"
+      
+          build_openssl() {
+            local arch=$1
+            local abi=$2
+            local temp_dir=$BUILD_DIR/temp-$abi
+      
+            echo "Building OpenSSL for $arch → $abi"
+            ./Configure "$arch" -D__ANDROID_API__=$ANDROID_API -fPIC no-shared
+            make -j$(nproc)
+            make install DESTDIR="$temp_dir"
+            make clean
+      
+            mkdir -p "$FINAL_DIR/$abi/include"
+            mkdir -p "$FINAL_DIR/$abi/lib"
+      
+            cp -r "$temp_dir/usr/local/include/"* "$FINAL_DIR/$abi/include/"
+            cp "$temp_dir/usr/local/lib/libcrypto.a" "$FINAL_DIR/$abi/lib/"
+            cp "$temp_dir/usr/local/lib/libssl.a" "$FINAL_DIR/$abi/lib/"
+          }
+      
+          build_openssl android-arm64 arm64-v8a
+          build_openssl android-arm armeabi-v7a
+        
+      - name: Build ONNX Runtime - Windows (x64)
+        if: matrix.platform == 'windows-x64'
+        shell: pwsh
+        run: |
+          .\build.bat `
+            --config Release `
+            --build_shared_lib `
+            --parallel `
+            --compile_no_warning_as_error `
+            --skip_submodule_sync `
+            --update `
+            --build `
+            --skip_tests `
+            --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF `
+            --use_dml `
+            --use_xnnpack
+
+          $ROOTDIR = $PWD
+          Write-Output "ROOTDIR is: $ROOTDIR"
+
+          # Créer les dossiers bin/lib/include
+          New-Item -ItemType Directory -Path "$ROOTDIR\build-onnxruntime\bin" -Force
+          New-Item -ItemType Directory -Path "$ROOTDIR\build-onnxruntime\lib" -Force
+          New-Item -ItemType Directory -Path "$ROOTDIR\build-onnxruntime\include\onnxruntime" -Force
+
+          # Copier les fichiers binaires et lib
+          Copy-Item -Path build\Windows\Release\Release\onnxruntime.dll -Destination "$ROOTDIR\build-onnxruntime\bin\" -Force -ErrorAction Stop
+          Copy-Item -Path build\Windows\Release\Release\onnxruntime_providers_shared.dll -Destination "$ROOTDIR\build-onnxruntime\bin\" -Force -ErrorAction Stop
+          Copy-Item -Path build\Windows\Release\Release\DirectML.dll -Destination "$ROOTDIR\build-onnxruntime\bin\" -Force -ErrorAction Stop
+          Copy-Item -Path build\Windows\Release\Release\onnxruntime.lib -Destination "$ROOTDIR\build-onnxruntime\lib\" -Force -ErrorAction Stop
+
+          # Copier tous les headers onnxruntime_* dans include/onnxruntime/
+          Copy-Item -Path include\onnxruntime\core\session\onnxruntime_*.h -Destination "$ROOTDIR\build-onnxruntime\include\onnxruntime" -Force
+
+          # Copier les factory headers des providers (CPU et DML) dans le même dossier
+          Copy-Item -Path include\onnxruntime\core\providers\cpu\cpu_provider_factory.h -Destination "$ROOTDIR\build-onnxruntime\include\onnxruntime" -Force
+          Copy-Item -Path include\onnxruntime\core\providers\dml\dml_provider_factory.h -Destination "$ROOTDIR\build-onnxruntime\include\onnxruntime" -Force
+
+      - name: Build ONNX Runtime - Windows (arm64)
+        if: matrix.platform == 'windows-arm64'
+        run: |
+          .\build.bat `
+            --config Release `
+            --build_shared_lib `
+            --parallel `
+            --compile_no_warning_as_error `
+            --skip_submodule_sync `
+            --update `
+            --build `
+            --skip_tests `
+            --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF `
+            --use_dml
+                    
+          $ROOTDIR = $PWD
+          Write-Output "ROOTDIR is: $ROOTDIR"
+          
+          # Créer les dossiers bin/lib/include
+          New-Item -ItemType Directory -Path "$ROOTDIR\build-onnxruntime\bin" -Force
+          New-Item -ItemType Directory -Path "$ROOTDIR\build-onnxruntime\lib" -Force
+          New-Item -ItemType Directory -Path "$ROOTDIR\build-onnxruntime\include\onnxruntime" -Force
+
+          # Copier les fichiers binaires et lib
+          Copy-Item -Path build\Windows\Release\Release\onnxruntime.dll -Destination "$ROOTDIR\build-onnxruntime\bin\" -Force -ErrorAction Stop
+          Copy-Item -Path build\Windows\Release\Release\onnxruntime_providers_shared.dll -Destination "$ROOTDIR\build-onnxruntime\bin\" -Force -ErrorAction Stop
+          Copy-Item -Path build\Windows\Release\Release\DirectML.dll -Destination "$ROOTDIR\build-onnxruntime\bin\" -Force -ErrorAction Stop
+          Copy-Item -Path build\Windows\Release\Release\onnxruntime.lib -Destination "$ROOTDIR\build-onnxruntime\lib\" -Force -ErrorAction Stop
+
+          # Copier tous les headers onnxruntime_* dans include/onnxruntime/
+          Copy-Item -Path include\onnxruntime\core\session\onnxruntime_*.h -Destination "$ROOTDIR\build-onnxruntime\include\onnxruntime" -Force
+
+          # Copier les factory headers des providers (CPU et DML) dans le même dossier
+          Copy-Item -Path include\onnxruntime\core\providers\cpu\cpu_provider_factory.h -Destination "$ROOTDIR\build-onnxruntime\include\onnxruntime" -Force
+          Copy-Item -Path include\onnxruntime\core\providers\dml\dml_provider_factory.h -Destination "$ROOTDIR\build-onnxruntime\include\onnxruntime" -Force
+        shell: pwsh
+
+      - name: Build ONNX Runtime - Linux (x64/arm64)
+        if: matrix.platform == 'linux-arm64' || matrix.platform == 'linux-x64'
+        run: |
+          ./build.sh \
+            --config Release \
+            --build_shared_lib \
+            --parallel \
+            --compile_no_warning_as_error \
+            --skip_submodule_sync \
+            --update \
+            --build \
+            --skip_tests \
+            --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF \
+            --use_xnnpack
+          
+          ROOTDIR=$(pwd)
+          mkdir -p "$ROOTDIR/build-onnxruntime/lib"
+          mkdir -p "$ROOTDIR/build-onnxruntime/include/onnxruntime"
+
+          # Copier la lib partagée
+          cp -a build/Linux/Release/libonnxruntime.so* "$ROOTDIR/build-onnxruntime/lib"
+
+          # Copier les headers onnxruntime_*.h
+          cp -a include/onnxruntime/core/session/onnxruntime_*.h "$ROOTDIR/build-onnxruntime/include/onnxruntime"
+
+          # Copier le CPU provider factory
+          cp include/onnxruntime/core/providers/cpu/cpu_provider_factory.h "$ROOTDIR/build-onnxruntime/include/onnxruntime"
+        shell: bash
+
+      - name: Build ONNX Runtime - SLR3 Sniper (x64/arm64)
+        if: matrix.platform == 'slr3-sniper-x64' || matrix.platform == 'slr3-sniper-arm64'
+        run: |
+          ./build.sh \
+            --config Release \
+            --build_shared_lib \
+            --parallel \
+            --compile_no_warning_as_error \
+            --skip_submodule_sync \
+            --allow_running_as_root \
+            --update \
+            --build \
+            --skip_tests \
+            --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF \
+            --use_xnnpack
+
+          ROOTDIR=$(pwd)
+          mkdir -p "$ROOTDIR/build-onnxruntime/lib"
+          mkdir -p "$ROOTDIR/build-onnxruntime/include/onnxruntime"
+
+          # Copier la lib partagée
+          cp -a build/Linux/Release/libonnxruntime.so* "$ROOTDIR/build-onnxruntime/lib"
+
+          # Copier les headers onnxruntime_*.h
+          cp -a include/onnxruntime/core/session/onnxruntime_*.h "$ROOTDIR/build-onnxruntime/include/onnxruntime"
+
+          # Copier le CPU provider factory
+          cp include/onnxruntime/core/providers/cpu/cpu_provider_factory.h "$ROOTDIR/build-onnxruntime/include/onnxruntime"
+        shell: bash
+
+      - name: Build ONNX Runtime - Android (arm64-v8a / armeabi-v7a)
+        if: matrix.platform == 'android'
+        run: |
+          # Créer le dossier de sortie
+          mkdir -p build-onnxruntime/armeabi-v7a/aar
+          mkdir -p build-onnxruntime/armeabi-v7a/lib
+          mkdir -p build-onnxruntime/arm64-v8a/aar
+          mkdir -p build-onnxruntime/arm64-v8a/lib
+
+          # arm64-v8a
+          ./build.sh \
+            --config Release \
+            --android \
+            --android_sdk_path $ANDROID_SDK_ROOT \
+            --android_ndk_path $ANDROID_NDK_ROOT \
+            --android_abi arm64-v8a \
+            --android_api ${{ env.ANDROID_API }} \
+            --skip_submodule_sync \
+            --skip_tests \
+            --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF \
+            --build_java \
+            --use_nnapi
+          
+          # Copier le fichier .aar + le fichier .so
+          cp -a build/Android/Release/java/build/android/outputs/aar/onnxruntime-debug.aar build-onnxruntime/arm64-v8a/aar
+          cp -a build/Android/Release/java/build/android/outputs/aar/onnxruntime-release.aar build-onnxruntime/arm64-v8a/aar
+          cp -a build/Android/Release/libonnxruntime.so build-onnxruntime/arm64-v8a/lib
+          cp -a build/Android/Release/libonnxruntime4j_jni.so build-onnxruntime/arm64-v8a/lib
+          
+          # Supprimer le dossier de build entre chaque build
+          rm -rf build/
+
+          # armeabi-v7a
+          ./build.sh \
+            --config Release \
+            --android \
+            --android_sdk_path $ANDROID_SDK_ROOT \
+            --android_ndk_path $ANDROID_NDK_ROOT \
+            --android_abi armeabi-v7a \
+            --android_api ${{ env.ANDROID_API }} \
+            --skip_submodule_sync \
+            --skip_tests \
+            --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF \
+            --build_java \
+            --use_nnapi
+
+          # Copier le fichier .aar + le fichier .so
+          cp -a build/Android/Release/java/build/android/outputs/aar/onnxruntime-debug.aar build-onnxruntime/armeabi-v7a/aar
+          cp -a build/Android/Release/java/build/android/outputs/aar/onnxruntime-release.aar build-onnxruntime/armeabi-v7a/aar
+          cp -a build/Android/Release/libonnxruntime.so build-onnxruntime/armeabi-v7a/lib
+          cp -a build/Android/Release/libonnxruntime4j_jni.so build-onnxruntime/armeabi-v7a/lib
+
+          # Créer le dossier include commun
+          mkdir -p build-onnxruntime/include/onnxruntime
+
+          # Copier les headers principaux
+          cp -a include/onnxruntime/core/session/onnxruntime_*.h build-onnxruntime/include/onnxruntime
+
+          # Copier les factory headers des execution providers utilisés
+          cp include/onnxruntime/core/providers/cpu/cpu_provider_factory.h build-onnxruntime/include/onnxruntime
+          cp include/onnxruntime/core/providers/nnapi/nnapi_provider_factory.h build-onnxruntime/include/onnxruntime
+        shell: bash
+
+      - name: Build ONNX Runtime - macOS (arm64)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          # Build arm64 binary
+          ./build.sh \
+            --config Release \
+            --use_coreml \
+            --build_shared_lib \
+            --apple_deploy_target ${{ env.CMAKE_OSX_DEPLOYMENT_TARGET }} \
+            --parallel \
+            --compile_no_warning_as_error \
+            --skip_submodule_sync \
+            --update \
+            --build \
+            --skip_tests \
+            --cmake_extra_defines \
+              CMAKE_OSX_ARCHITECTURES=arm64 \
+              onnxruntime_BUILD_UNIT_TESTS=OFF
+
+          ROOTDIR=$(pwd)
+          mkdir -p "$ROOTDIR/build-onnxruntime/lib"
+          mkdir -p "$ROOTDIR/build-onnxruntime/include/onnxruntime"
+
+          # Copier les binaires .dylib (universels)
+          cp -a build/MacOS/Release/libonnxruntime.dylib "$ROOTDIR/build-onnxruntime/lib"
+          cp -a build/MacOS/Release/libonnxruntime.*.dylib "$ROOTDIR/build-onnxruntime/lib"
+
+          # Copier les headers principaux
+          cp -a include/onnxruntime/core/session/onnxruntime_*.h "$ROOTDIR/build-onnxruntime/include/onnxruntime"
+
+          # Copier les provider_factory.h requis
+          cp include/onnxruntime/core/providers/cpu/cpu_provider_factory.h "$ROOTDIR/build-onnxruntime/include/onnxruntime"
+          cp include/onnxruntime/core/providers/coreml/coreml_provider_factory.h "$ROOTDIR/build-onnxruntime/include/onnxruntime" 
+
+      - name: Build ONNX Runtime - iOS Device (arm64)
+        if: matrix.platform == 'ios'
+        run: |
+          ./build.sh \
+            --config Release \
+            --use_coreml \
+            --use_xcode \
+            --ios \
+            --apple_sysroot iphoneos \
+            --osx_arch arm64 \
+            --build_apple_framework \
+            --apple_deploy_target ${{ env.IOS_DEPLOYMENT_TARGET }} \
+            --skip_submodule_sync \
+            --skip_tests \
+            --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF
+
+          mkdir -p build-onnxruntime build-onnxruntime/lib build-onnxruntime/include/onnxruntime
+          cp -a build/iOS/Release/Release-iphoneos/static_framework/onnxruntime.framework/onnxruntime build-onnxruntime/lib/onnxruntime.a
+          cp -a build/iOS/Release/Release-iphoneos/static_framework/onnxruntime.framework/Headers/* build-onnxruntime/include/onnxruntime
+        shell: bash
+
+      - name: Upload OpenSSL Artifacts - macOS (arm64)
+        if: matrix.platform == 'macos'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openssl-macos-x64_arm64
+          path: openssl-macos
+
+      - name: Upload OpenSSL Artifacts - iOS (arm64)
+        if: matrix.platform == 'ios'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openssl-ios-arm64
+          path: openssl-ios
+
+      - name: Upload OpenSSL Artifacts - Android (arm64-v8a / armeabi-v7a)
+        if: matrix.platform == 'android'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openssl-android-arm64v8a_armeabiv7a
+          path: openssl-android/
+
+      - name: Upload OpenSSL Artifacts - SLR3 Sniper (x64)
+        if: matrix.platform == 'slr3-sniper-x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openssl-slr3-sniper-x64
+          path: openssl-src/build-output/x86_64
+      
+      - name: Upload OpenSSL Artifacts - SLR3 Sniper (arm64)
+        if: matrix.platform == 'slr3-sniper-arm64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openssl-slr3-sniper-arm64
+          path: openssl-src/build-output/arm64
+
+      - name: Upload OpenSSL Artifacts - Linux (x64)
+        if: matrix.platform == 'linux-x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openssl-linux-x64
+          path: openssl-src/build-output/x86_64
+
+      - name: Upload OpenSSL Artifacts - Linux (arm64)
+        if: matrix.platform == 'linux-arm64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openssl-linux-arm64
+          path: openssl-src/build-output/arm64
+
+      - name: Upload OpenSSL Artifacts - Windows (x64)
+        if: matrix.platform == 'windows-x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openssl-windows-x64
+          path: openssl-artifact-windows/x64
+
+      - name: Upload OpenSSL Artifacts - Windows (arm64)
+        if: matrix.platform == 'windows-arm64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openssl-windows-arm64
+          path: openssl-artifact-windows/arm64
+
+      - name: Upload ONNX Runtime Artifacts - Windows (x64)
+        if: matrix.platform == 'windows-x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnxruntime-windows-x64
+          path: build-onnxruntime
+
+      - name: Upload ONNX Runtime Artifacts - Windows (arm64)
+        if: matrix.platform == 'windows-arm64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnxruntime-windows-arm64
+          path: build-onnxruntime
+
+      - name: Upload ONNX Runtime Artifacts - Linux (x64)
+        if: matrix.platform == 'linux-x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnxruntime-linux-x64
+          path: build-onnxruntime
+
+      - name: Upload ONNX Runtime Artifacts - Linux (arm64)
+        if: matrix.platform == 'linux-arm64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnxruntime-linux-arm64
+          path: build-onnxruntime
+
+      - name: Upload ONNX Runtime Artifacts - SLR3 Sniper (x64)
+        if: matrix.platform == 'slr3-sniper-x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnxruntime-slr3-sniper-x64
+          path: build-onnxruntime
+
+      - name: Upload ONNX Runtime Artifacts - SLR3 Sniper (arm64)
+        if: matrix.platform == 'slr3-sniper-arm64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnxruntime-slr3-sniper-arm64
+          path: build-onnxruntime
+
+      - name: Upload ONNX Runtime Artifacts - Android (arm64-v8a / armeabi-v7a)
+        if: matrix.platform == 'android'
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnxruntime-android-arm64v8a_armeabiv7a
+          path: build-onnxruntime
+
+      - name: Upload ONNX Runtime Artifacts - macOS (arm64)
+        if: matrix.platform == 'macos'
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnxruntime-macos-x64_arm64
+          path: build-onnxruntime
+
+      - name: Upload ONNX Runtime Artifacts - iOS (arm64)
+        if: matrix.platform == 'ios'
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnxruntime-ios-arm64
+          path: build-onnxruntime
+  
+      - name: Upload SDL3_shadercross Artifacts - All Platforms (except iOS/Android)
+        if: ${{ matrix.platform != 'ios' && matrix.platform != 'android' }}
+        uses: actions/upload-artifact@v4
+        with:
+          if-no-files-found: error
+          name: sdl3_shadercross-${{ matrix.platform }}
+          path: sdl_shadercross-src/prefix
+
+  combine-artifacts:
+    name: Combine artifacts
+    needs: build-libs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: temp
+
+      - name: Restructure artifacts
+        run: |
+          # --------- OpenSSL ---------
+          # Linux (x64 / arm64)
+          mkdir -p merged/linux/include merged/linux/lib/x64 merged/linux/lib/arm64
+          cp -a temp/openssl-linux-x64/include/* merged/linux/include/
+          cp -a temp/openssl-linux-x64/lib/* merged/linux/lib/x64/
+          cp -a temp/openssl-linux-arm64/include/* merged/linux/include/
+          cp -a temp/openssl-linux-arm64/lib/* merged/linux/lib/arm64/
+
+          # Windows (x64 / arm64)
+          mkdir -p merged/windows/include merged/windows/lib/x64 merged/windows/lib/arm64
+          cp -a temp/openssl-windows-x64/include/* merged/windows/include/
+          cp -a temp/openssl-windows-x64/lib/* merged/windows/lib/x64/
+          cp -a temp/openssl-windows-arm64/include/* merged/windows/include/
+          cp -a temp/openssl-windows-arm64/lib/* merged/windows/lib/arm64/
+
+          # Android (arm64-v8a / armeabi-v7a)
+          mkdir -p merged/android/include merged/android/lib/arm64-v8a merged/android/lib/armeabi-v7a
+          cp -a temp/openssl-android/arm64-v8a/include/* merged/android/include/
+          cp -a temp/openssl-android/arm64-v8a/lib/* merged/android/lib/arm64-v8a/
+          cp -a temp/openssl-android/armeabi-v7a/lib/* merged/android/lib/armeabi-v7a/
+
+          # SLR3 Sniper (x64 / arm64)
+          mkdir -p merged/slr3-sniper/include merged/slr3-sniper/lib/x64 merged/slr3-sniper/lib/arm64
+          cp -a temp/openssl-slr3-sniper-x64/include/* merged/slr3-sniper/include/
+          cp -a temp/openssl-slr3-sniper-x64/lib/* merged/slr3-sniper/lib/x64/
+          cp -a temp/openssl-slr3-sniper-arm64/include/* merged/slr3-sniper/include/
+          cp -a temp/openssl-slr3-sniper-arm64/lib/* merged/slr3-sniper/lib/arm64/
+
+
+          # ------- ONNX Runtime ---------
+          # Linux (x64 / arm64)
+          mkdir -p merged2/linux/include merged2/linux/lib/x64 merged2/linux/lib/arm64
+          cp -a temp/onnxruntime-linux-x64/include/* merged2/linux/include/
+          cp -a temp/onnxruntime-linux-x64/lib/* merged2/linux/lib/x64/
+          cp -a temp/onnxruntime-linux-arm64/include/* merged2/linux/include/
+          cp -a temp/onnxruntime-linux-arm64/lib/* merged2/linux/lib/arm64/
+
+          # Windows (x64 / arm64)
+          mkdir -p merged2/windows/include merged2/windows/lib/x64 merged2/windows/lib/arm64
+          cp -a temp/onnxruntime-windows-x64/include/* merged2/windows/include/
+          cp -a temp/onnxruntime-windows-x64/lib/* merged2/windows/lib/x64/
+          cp -a temp/onnxruntime-windows-arm64/include/* merged2/windows/include/
+          cp -a temp/onnxruntime-windows-arm64/lib/* merged2/windows/lib/arm64/
+
+          # Android (arm64-v8a / armeabi-v7a)
+          mkdir -p merged2/android/include merged2/android/lib/arm64-v8a merged2/android/lib/armeabi-v7a
+          cp -a temp/onnxruntime-android/arm64-v8a/include/* merged2/android/include/
+          cp -a temp/onnxruntime-android/arm64-v8a/lib/* merged2/android/lib/arm64-v8a/
+          cp -a temp/onnxruntime-android/armeabi-v7a/lib/* merged2/android/lib/armeabi-v7a/
+
+          # SLR3 Sniper (x64 / arm64)
+          mkdir -p merged2/slr3-sniper/include merged2/slr3-sniper/lib/x64 merged2/slr3-sniper/lib/arm64
+          cp -a temp/onnxruntime-slr3-sniper-x64/include/* merged2/slr3-sniper/include/
+          cp -a temp/onnxruntime-slr3-sniper-x64/lib/* merged2/slr3-sniper/lib/x64/
+          cp -a temp/onnxruntime-slr3-sniper-arm64/include/* merged2/slr3-sniper/include/
+          cp -a temp/onnxruntime-slr3-sniper-arm64/lib/* merged2/slr3-sniper/lib/arm64/
+
+          # macOS (arm64)
+          mkdir -p merged2/macos/include merged2/macos/lib
+          cp -a temp/onnxruntime-macos/include/* merged2/macos/include/
+          cp -a temp/onnxruntime-macos/lib/* merged2/macos/lib/
+
+          # iOS (arm64)
+          mkdir -p merged2/ios/include merged2/ios/lib
+          cp -a temp/onnxruntime-ios/include/* merged2/ios/include/
+          cp -a temp/onnxruntime-ios/lib/* merged2/ios/lib/
+
+      - name: Zip merged folders
+        run: |
+          cd merged
+          zip -r ../openssl-linux.zip linux/*
+          zip -r ../openssl-windows.zip windows/*
+          zip -r ../openssl-android.zip android/*
+          zip -r ../openssl-slr3-sniper.zip slr3-sniper/*
+          cd ../merged2
+          zip -r ../onnxruntime-linux.zip linux/*
+          zip -r ../onnxruntime-windows.zip windows/*
+          zip -r ../onnxruntime-android.zip android/*
+          zip -r ../onnxruntime-slr3-sniper.zip slr3-sniper/*
+          zip -r ../onnxruntime-macos.zip macos/*
+          zip -r ../onnxruntime-ios.zip ios/*
+
+      - name: Generate release notes
+        run: |
+          OPENSSL_TAG="${{ env.OPENSSL_TAG }}"
+          ONNX_TAG="${{ env.ONNXRUNTIME_TAG }}"
+          SDL_SHADERCROSS_TAG="${{ env.SDL_SHADERCROSS_TAG }}"
+      
+          OPENSSL_VERSION="${OPENSSL_TAG#openssl-}"
+          ONNX_VERSION="${ONNX_TAG#v}"
+          SDL_SHADERCROSS_VERSION="${SDL_SHADERCROSS_TAG}"
+      
+          echo "## Build Dependencies Versions" > release_notes.md
+          echo "" >> release_notes.md
+          echo "- OpenSSL: $OPENSSL_VERSION" >> release_notes.md
+          echo "- ONNX Runtime: $ONNX_VERSION" >> release_notes.md
+          echo "- SDL3_shadercross: $SDL_SHADERCROSS_VERSION" >> release_notes.md
+
+      - name: Deploy assets to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            openssl-linux.zip
+            openssl-windows.zip
+            openssl-android.zip
+            openssl-slr3-sniper.zip
+            onnxruntime-linux.zip
+            onnxruntime-windows.zip
+            onnxruntime-android.zip
+            onnxruntime-slr3-sniper.zip
+            onnxruntime-macos.zip
+            onnxruntime-ios.zip
+          body_path: release_notes.md
+          #token:
